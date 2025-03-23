@@ -1,0 +1,141 @@
+from AlgorithmImports import *
+import tensorflow as tf
+import numpy as np
+
+class CryptoMLAlgorithm(QCAlgorithm):
+
+    def Initialize(self):
+        # Période d'exécution et capital initial
+        self.SetStartDate(2023, 1, 1)
+        self.SetEndDate(2023, 12, 31)
+        self.SetCash(100000)
+
+        # Ajout de l'actif crypto (BTCUSD via GDAX)
+        self.symbol = self.AddCrypto("ETHUSD", Resolution.Hour, Market.GDAX).Symbol
+
+        # Définition de la période de lookback (nombre d'heures utilisées pour les features)
+        self.lookback = 48  # 24 heures
+        self.price_window = RollingWindow[float](self.lookback + 1)
+        self.SetWarmUp(self.lookback + 1)
+        
+        # Variables pour le modèle ML
+        self.model_trained = False
+        self.model = None
+        
+        # Paramètres de gestion du risque
+        self.stopLossPct = 0.02    # Stop-loss à 2%
+        self.baselineVol = 0.01    # Volatilité de référence pour le dimensionnement
+        
+        # Variable pour mémoriser le prix d'entrée
+        self.entryPrice = None
+
+        self.Debug("Initialisation terminée.")
+
+    def OnData(self, data):
+        if self.IsWarmingUp:
+            return
+        
+        if not data.ContainsKey(self.symbol):
+            return
+
+        # Mise à jour de la fenêtre de prix
+        price = data[self.symbol].Close
+        self.price_window.Add(price)
+        if self.price_window.Count < self.lookback + 1:
+            return
+
+        # Entraîner le modèle une seule fois après le warm-up
+        if not self.model_trained:
+            self.TrainModel()
+            self.model_trained = True
+
+        # Préparation des features pour la prédiction (normalisation de la fenêtre de prix)
+        prices = np.array([p for p in self.price_window])
+        window = prices[:-1]
+        window_norm = (window - np.mean(window)) / np.std(window)
+        features = window_norm.reshape((1, self.lookback, 1))
+        prediction = self.model.predict(features)
+        predicted_return = prediction[0][0]
+        self.Debug(f"Prédiction du rendement: {predicted_return:.5f}")
+
+        # Calcul de la volatilité actuelle à partir des retours récents
+        returns = np.diff(prices) / (prices[:-1] + 1e-8)
+        current_vol = np.std(returns)
+        self.Debug(f"Volatilité actuelle: {current_vol:.5f}")
+
+        # Seuil dynamique : par exemple, la moitié de la volatilité actuelle
+        dynamic_threshold = 0.5 * current_vol
+
+        # Taille de position adaptative : réduire la position si la volatilité augmente
+        position_fraction = min(1, self.baselineVol / current_vol) if current_vol > 0 else 1
+
+        current_qty = self.Portfolio[self.symbol].Quantity
+
+        # Gestion du stop-loss
+        if current_qty > 0 and self.entryPrice is not None:
+            if price < self.entryPrice * (1 - self.stopLossPct):
+                self.Liquidate(self.symbol)
+                self.Debug("Stop-loss long déclenché.")
+                self.entryPrice = None
+                return
+        elif current_qty < 0 and self.entryPrice is not None:
+            if price > self.entryPrice * (1 + self.stopLossPct):
+                self.Liquidate(self.symbol)
+                self.Debug("Stop-loss short déclenché.")
+                self.entryPrice = None
+                return
+
+        # Logique d'entrée et de sortie :
+        # Si aucune position n'est ouverte, entrer long ou short selon le signal
+        if current_qty == 0:
+            if predicted_return > dynamic_threshold:
+                self.SetHoldings(self.symbol, position_fraction)
+                self.entryPrice = price
+                self.Debug(f"Entrée longue: fraction {position_fraction:.2f}, prix {price}")
+            elif predicted_return < -dynamic_threshold:
+                self.SetHoldings(self.symbol, -position_fraction)
+                self.entryPrice = price
+                self.Debug(f"Entrée short: fraction {position_fraction:.2f}, prix {price}")
+        else:
+            # Sortie de position si le signal devient neutre
+            if -dynamic_threshold <= predicted_return <= dynamic_threshold:
+                self.Liquidate(self.symbol)
+                self.Debug("Sortie de position sur signal neutre.")
+                self.entryPrice = None
+
+    def TrainModel(self):
+        # Récupérer des données historiques pour entraîner le modèle
+        history = self.History(self.symbol, self.lookback * 100, Resolution.Hour)
+        if history.empty:
+            self.Debug("Pas de données historiques suffisantes pour entraîner le modèle.")
+            return
+        
+        df = history.loc[str(self.symbol)]
+        df = df.sort_index()
+        prices = df['close'].values
+        
+        X, y = [], []
+        # Construction des fenêtres glissantes pour le jeu d'entraînement
+        for i in range(len(prices) - self.lookback - 1):
+            window = prices[i:i+self.lookback]
+            next_price = prices[i+self.lookback]
+            current_price = prices[i+self.lookback-1]
+            ret = (next_price - current_price) / current_price
+            window_norm = (window - np.mean(window)) / np.std(window)
+            X.append(window_norm)
+            y.append(ret)
+            
+        X = np.array(X)
+        y = np.array(y)
+        X = X.reshape((X.shape[0], X.shape[1], 1))
+        
+        # Construction d'un modèle LSTM simple
+        model = tf.keras.models.Sequential()
+        model.add(tf.keras.layers.LSTM(50, input_shape=(self.lookback, 1)))
+        model.add(tf.keras.layers.Dense(1))
+        model.compile(optimizer=tf.keras.optimizers.Adam(learning_rate=0.001), loss='mse')
+        
+        self.Debug("Entraînement du modèle TensorFlow...")
+        model.fit(X, y, epochs=5, batch_size=32, verbose=0)
+        self.model = model
+        self.Debug("Modèle entraîné avec succès.")
